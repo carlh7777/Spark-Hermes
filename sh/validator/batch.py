@@ -18,6 +18,7 @@ from pathlib import Path
 
 from sh.validator.episode import run_episode
 from sh.validator.grade import grade
+from sh.validator.truncation import suite_truncation
 
 
 def one(
@@ -135,7 +136,13 @@ def main(argv=None) -> int:
         jobs = voided
     total = time.time() - t0
     (out / "episodes.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
-    summary = {"episodes": len(recs), "total_wall_s": round(total, 1), "concurrency": a.concurrency, "per_surface": {}}
+    summary = {
+        "episodes": len(recs),
+        "total_wall_s": round(total, 1),
+        "concurrency": a.concurrency,
+        **suite_truncation(recs),
+        "per_surface": {},
+    }
     for name in surfaces:
         rs = [r for r in recs if r["surface"] == name]
         if rs:
@@ -147,6 +154,8 @@ def main(argv=None) -> int:
                 "dq": sum(r["disqualified"] for r in rs),
                 "partial": sum(r["partial"] for r in rs),
                 "timed_out": sum(r["timed_out"] for r in rs),
+                "truncated": sum(bool(r.get("truncated")) for r in rs),
+                "truncated_failures": sum(1 for r in rs if r.get("truncated") and not r.get("verified_success")),
                 "mean_wall_s": round(statistics.mean(walls), 1) if walls else None,
                 "mean_api_calls": round(statistics.mean(r["api_calls"] or 0 for r in rs), 1),
                 "self_checked": sum(bool(r["self_checked"]) for r in rs),

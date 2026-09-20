@@ -72,6 +72,7 @@ def test_closing_a_round_verifies_every_commitment(tmp_path):
     eps = _episodes(tmp_path, [("null", False), ("5Fminer", True)])
     record = close(rd, eps, tmp_path / "out")
     assert record["commitments_ok"] and record["commitments_verified"]["t-1"] is True
+    assert record["truncated_episodes"] == 0 and record["truncated_failures"] == 0
     assert json.loads((tmp_path / "out" / "reveal.json").read_text())["t-1"]["salt"] == SALT
 
 

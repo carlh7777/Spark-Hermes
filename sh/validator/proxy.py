@@ -55,18 +55,43 @@ def refusal(payload: bytes) -> bool:
     return int((j.get("usage") or {}).get("completion_tokens") or 0) == 0
 
 
-def spent(usage_file: Path) -> int:
-    """Tokens an episode has used so far, from the proxy's own record of the engine's counts."""
-    total = 0
+def usage_split(usage: dict) -> tuple[int, int]:
+    """`(action_tokens, reasoning_tokens)` from one engine usage blob.
+
+    Reasoning is a subset of `completion_tokens` when the engine reports it (`reasoning_tokens` or
+    `completion_tokens_details.reasoning_tokens`). Deliberation draws on its own allowance — the same argument
+    the runner already makes for thinking-only turns — so those tokens do not consume the action budget. When
+    the engine reports nothing (the current pin: no reasoning-token field), the split is `(prompt+completion, 0)`
+    and the action budget behaves exactly as before.
+    """
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    details = usage.get("completion_tokens_details")
+    extra = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    reasoning = int(extra or usage.get("reasoning_tokens") or 0)
+    reasoning = max(0, min(reasoning, completion))
+    return prompt + completion - reasoning, reasoning
+
+
+def spent_split(usage_file: Path) -> tuple[int, int]:
+    """Action and reasoning tokens an episode has used so far, from the proxy's own record."""
+    action = reasoning = 0
     try:
         with open(usage_file) as f:
             for line in f:
                 u = json.loads(line).get("usage") if line.strip() else None
                 if u:
-                    total += int(u.get("prompt_tokens") or 0) + int(u.get("completion_tokens") or 0)
+                    a, r = usage_split(u)
+                    action += a
+                    reasoning += r
     except (OSError, ValueError):
         pass
-    return total
+    return action, reasoning
+
+
+def spent(usage_file: Path) -> int:
+    """Action tokens an episode has used so far. Reasoning is billed separately when the engine reports it."""
+    return spent_split(usage_file)[0]
 
 
 class Tokens:
@@ -192,14 +217,25 @@ def make_handler(upstream: str, tokens: Tokens, usage_dir: Path, sampling: dict)
                 gate.leave(episode, lock)
 
         def _post(self, raw: bytes, episode: str, budget):
-            if budget and (used := spent(usage_dir / f"{episode}.jsonl")) >= budget:
+            action, reasoning = spent_split(usage_dir / f"{episode}.jsonl")
+            reasoning_budget = int(budget) * 2 if budget else 0
+            if budget and (action >= budget or (reasoning_budget and reasoning >= reasoning_budget)):
                 usage_dir.mkdir(parents=True, exist_ok=True)
+                mark = {"spent": action, "budget": budget}
+                if reasoning:
+                    mark["reasoning_spent"] = reasoning
+                    mark["reasoning_budget"] = reasoning_budget
                 with open(usage_dir / f"{episode}.jsonl", "a") as f:
-                    f.write(json.dumps({"t": time.time(), "budget_spent": {"spent": used, "budget": budget}}) + "\n")
+                    f.write(json.dumps({"t": time.time(), "budget_spent": mark}) + "\n")
+                which = (
+                    f"episode token budget spent: {action} of {budget} tokens"
+                    if action >= budget
+                    else f"episode reasoning budget spent: {reasoning} of {reasoning_budget} tokens"
+                )
                 body = json.dumps(
                     {
                         "error": {
-                            "message": f"episode token budget spent: {used} of {budget} tokens",
+                            "message": which,
                             "type": "insufficient_quota",
                             "code": "insufficient_quota",
                         }

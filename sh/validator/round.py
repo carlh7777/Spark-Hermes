@@ -23,6 +23,7 @@ from pathlib import Path
 
 from sh.scoring.v2 import PARAMS_V2, FamilyReference, MinerWindow, credit, score, weights
 from sh.validator.stats import family_stats, load_episodes
+from sh.validator.truncation import suite_truncation
 
 RESERVED_SURFACES = ("null", "canon")
 
@@ -134,6 +135,7 @@ def close(
         "era": era,
         "tasks": sorted(tasks),
         "episodes": len(eps),
+        **suite_truncation(eps),
         "family_stats": records,
         "scores": scores,
         "weights": w,

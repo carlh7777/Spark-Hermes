@@ -13,6 +13,8 @@ import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from sh.validator.truncation import suite_truncation
+
 Z_95 = 1.959963984540054
 
 
@@ -113,6 +115,7 @@ class Arm:
             "mean_credit": None if self.mean_credit is None else round(self.mean_credit, 4),
             "wilson": self.wilson(),
             "efficiency": self.efficiency(),
+            **suite_truncation(self.episodes),
         }
         return r
 
@@ -221,6 +224,7 @@ class FamilyStats:
             "delta_e_paired_instances": self.paired_instances(),
         }
         retire = self.retirement()
+        cut = suite_truncation(self.null.episodes + self.canon.episodes)
         return {
             "schema": "sh-family-stats-v2",
             "family": self.family,
@@ -230,6 +234,8 @@ class FamilyStats:
             "canon": canon,
             "label": self.label(),
             "partial_rate": round(self.partial_rate, 4),
+            "truncated_episodes": cut["truncated_episodes"],
+            "truncated_failures": cut["truncated_failures"],
             "in_rotation": retire is None,
             "retirement": retire,
         }

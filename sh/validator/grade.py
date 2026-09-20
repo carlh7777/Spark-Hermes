@@ -18,6 +18,8 @@ import tarfile
 import time
 from pathlib import Path
 
+from sh.validator.truncation import is_truncated, max_turns_hit, reasoning_allowance, turn_mix
+
 # The agent's own client reports these when the *provider* failed, not the episode. An episode that never got
 # its tokens says nothing about a miner's strategy, so it is void: not a success, not a failure, and not
 # evidence. `batch` re-runs a void episode rather than caching it.
@@ -52,6 +54,9 @@ def pins_digest(task: dict) -> str:
         {
             "sampling": PINNED_SAMPLING,
             "max_turns": task.get("max_turns"),
+            # Deliberation draws on its own allowance (default 2× max_turns). Recorded here so a run
+            # under a different reasoning cap is a different measurement, which is what pins_digest is for.
+            "max_reasoning_steps": reasoning_allowance(task),
             "timeout_s": task.get("timeout_s"),
             "token_budget": task.get("token_budget"),
             "family": task.get("family"),
@@ -394,6 +399,11 @@ def grade(
     if finish.get("budget_spent"):  # the episode used its budget: an ending, graded like any other, never a void
         signals.append("token_budget_spent")
         void = False
+    turns_capped = max_turns_hit(finish, result, task)
+    if turns_capped:
+        signals.append("max_turns_hit")
+    truncated = is_truncated(finish, result, task)
+    action_turns, reasoning_turns = turn_mix(messages)
     if finish.get("disk_guard"):
         signals.append("disk_abuse")
         void = False
@@ -457,6 +467,10 @@ def grade(
         "tool_errors": finish.get("tool_errors"),
         "partial": bool(finish.get("partial")),
         "timed_out": bool(finish.get("timed_out")),
+        "truncated": truncated,
+        "max_turns_hit": turns_capped,
+        "action_turns": action_turns,
+        "reasoning_turns": reasoning_turns,
         "finish_reason": finish.get("turn_exit_reason"),
         "published_failed": g.get("published_failed", ""),
         "withheld_failed": g.get("withheld_failed", ""),

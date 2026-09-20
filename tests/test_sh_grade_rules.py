@@ -143,6 +143,7 @@ def test_a_timed_out_episode_is_not_also_accused_of_tampering(monkeypatch, tmp_p
     rec = g.grade(tmp_path, {"task_id": "t-1", "published": {"predicates": []}}, None, "img")
     assert rec["signals"] == ["timed_out"]
     assert not rec["disqualified"]
+    assert rec["truncated"] is True and rec["max_turns_hit"] is False
 
 
 def test_a_provider_outage_is_void_not_a_miner_failure(monkeypatch, tmp_path):
@@ -159,6 +160,7 @@ def test_a_provider_outage_is_void_not_a_miner_failure(monkeypatch, tmp_path):
     assert rec["void"] and rec["void_reason"] == "overloaded"
     assert "inference_unavailable" in rec["signals"]
     assert not rec["disqualified"]  # it is not the miner's fault either
+    assert rec["truncated"] is False
 
 
 def test_an_ordinary_failure_is_not_void(monkeypatch, tmp_path):
@@ -404,6 +406,9 @@ def test_an_episode_records_the_withheld_half_and_the_pins_it_was_graded_under(m
     rec = g.grade(tmp_path, task, w, "img")
     assert len(rec["withheld_sha256"]) == 64 and rec["pins_sha256"] == g.pins_digest(task)
     assert g.pins_digest({**task, "token_budget": None}) != rec["pins_sha256"]
+    assert g.pins_digest({**task, "max_reasoning_steps": 1}) != rec["pins_sha256"]
+    assert rec["truncated"] is False and rec["max_turns_hit"] is False
+    assert rec["action_turns"] == 0 and rec["reasoning_turns"] == 0
 
 
 def test_a_committed_task_with_no_reveal_fails_the_commitment_check(tmp_path):
@@ -422,3 +427,37 @@ def test_a_committed_task_with_no_reveal_fails_the_commitment_check(tmp_path):
     )
     record = close(rd, rd / "episodes", rd / "out", reveal_dir=rd / "withheld")
     assert record["commitments_ok"] is False and record["commitments_verified"]["t0"] is False
+
+
+def test_a_turn_cap_is_truncated_and_named(monkeypatch, tmp_path):
+    """The harness cut in. Named as max_turns_hit, recorded as truncated, still graded — not a void, not a DQ."""
+    import sh.validator.grade as g
+
+    (tmp_path / "result.json").write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "assistant", "reasoning": "plan", "content": ""},
+                    {"role": "assistant", "tool_calls": [{"id": "c0", "function": {"name": "terminal"}}]},
+                ],
+                "completed": False,
+                "turn_exit_reason": "max_iterations_reached(100/100)",
+                "api_calls": 100,
+            }
+        )
+    )
+    (tmp_path / "finish.json").write_text(
+        json.dumps(
+            {
+                "api_calls": 100,
+                "completed": False,
+                "turn_exit_reason": "max_iterations_reached(100/100)",
+            }
+        )
+    )
+    monkeypatch.setattr(g, "grade_in_container", lambda *a, **k: {"published_pass": False, "protected_modified": []})
+    rec = g.grade(tmp_path, {"task_id": "t-1", "published": {"predicates": []}, "max_turns": 100}, None, "img")
+    assert rec["truncated"] and rec["max_turns_hit"]
+    assert "max_turns_hit" in rec["signals"]
+    assert rec["action_turns"] == 1 and rec["reasoning_turns"] == 1
+    assert not rec["void"] and not rec["disqualified"]

@@ -112,11 +112,21 @@ def main() -> int:
         finish["bundle_sha256"] = got
 
         # 2. config + env
+        max_turns = int(task["max_turns"])
+        # Deliberation draws on its own allowance, for the same reason verification does: max_turns is an
+        # ACTION budget. Unmodified Hermes counts every API call against max_iterations, including a turn that
+        # only thought, so a reasoning-only call would otherwise steal an action. Default 2× max_turns when
+        # the task does not set one — bounded rather than free. A policy that bundles thinking into the same
+        # call as a tool (the pin: <think> inside the gpt turn) does not spend the extra.
+        max_reasoning_steps = (
+            int(task["max_reasoning_steps"]) if task.get("max_reasoning_steps") is not None else max_turns * 2
+        )
+        max_iterations = max_turns + max_reasoning_steps
         (HOME / "config.yaml").write_text(
             "model:\n  default: %s\nproviders:\n  custom:\n    base_url: %s\n    api_key_env: SH_TOKEN\n"
             "agent:\n  max_turns: %d\nterminal:\n  backend: local\n  cwd: %s\n"
             "skills:\n  inline_shell: false\n  template_vars: false\n  auto_load: []\n  write_approval: true\n  guard_agent_created: true\n"
-            % (MODEL, INFERENCE, int(task["max_turns"]), WS)
+            % (MODEL, INFERENCE, max_iterations, WS)
         )
         (HOME / ".env").write_text(f"SH_TOKEN={TOKEN}\n")
 
@@ -151,7 +161,7 @@ def main() -> int:
             model=MODEL,
             base_url=INFERENCE,
             api_key=TOKEN,
-            max_iterations=int(task["max_turns"]),
+            max_iterations=max_iterations,
             enabled_toolsets=[*task["tools"], SKILLS_TOOLSET],
             skip_memory=True,
             skip_context_files=False,
@@ -188,6 +198,8 @@ def main() -> int:
             partial=bool(result.get("partial")),
             failed=bool(result.get("failed")),
             turn_exit_reason=str(result.get("turn_exit_reason")),
+            max_turns=max_turns,
+            max_reasoning_steps=max_reasoning_steps,
             final_head=str(result.get("final_response", ""))[:300],
         )
     except SystemExit:

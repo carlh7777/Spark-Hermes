@@ -77,6 +77,19 @@ def test_a_harness_fault_is_reported_as_one_and_takes_precedence():
     assert st.partial_rate == 0.5 and "harness or template fault" in st.retirement()
 
 
+def test_truncation_is_on_the_family_record_beside_the_rate():
+    """The field is present at zero on a clean window, and counts only truncated reference episodes."""
+    clean = family_stats(_eps("null", 8, 3) + _eps("canon", 8, 6), "posix_report", ["r1"], "e0")
+    assert clean.record()["truncated_episodes"] == 0 and clean.record()["truncated_failures"] == 0
+    cut = family_stats(
+        _eps("null", 8, 3, truncated=True) + _eps("canon", 8, 0, truncated=True), "posix_report", ["r1"], "e0"
+    )
+    r = cut.record()
+    assert r["truncated_episodes"] == 16
+    assert r["truncated_failures"] == 13  # 5 null failures + 8 canon failures
+    assert r["null"]["p"] == 0.375  # the headline is unchanged; the counts sit beside it
+
+
 def test_stats_recompute_identically_from_the_archive(tmp_path):
     """The D1 exit: the archive is the source of truth, not any in-memory accumulator."""
     eps = _eps("null", 8, 3, api=9) + _eps("canon", 8, 6, api=6)

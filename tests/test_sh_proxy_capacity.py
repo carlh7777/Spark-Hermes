@@ -103,6 +103,58 @@ def test_a_spent_token_budget_ends_the_episode_with_a_402_and_a_marker(tmp_path)
     assert tokens.issue("ep-5", ttl=60) and _post(proxy.server_address[1], tokens.issue("ep-5", ttl=60))[0] == 200
 
 
+def test_reasoning_tokens_do_not_spend_the_action_budget(tmp_path):
+    """Deliberation draws on its own allowance. When the engine reports reasoning_tokens as a subset of
+    completion, those tokens must not 402 the action budget — otherwise the harness penalises thinking, which
+    is the same defect the runner's max_reasoning_steps exists to stop at the turn counter."""
+    engine, seen = _engine(
+        [
+            (
+                200,
+                {
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 400,
+                        "completion_tokens_details": {"reasoning_tokens": 350},
+                    }
+                },
+            ),
+            (200, {"usage": {"prompt_tokens": 10, "completion_tokens": 10}}),
+        ]
+    )
+    proxy, tokens = _proxy(tmp_path, f"http://127.0.0.1:{engine.server_address[1]}")
+    tok = tokens.issue("ep-r", ttl=60, budget=200)
+    assert _post(proxy.server_address[1], tok)[0] == 200  # action 150, reasoning 350; action budget 200 still open
+    status, _ = _post(proxy.server_address[1], tok)
+    assert status == 200 and len(seen) == 2  # second call forwarded; reasoning did not trip the 402
+    assert P.usage_split(
+        {"prompt_tokens": 100, "completion_tokens": 400, "completion_tokens_details": {"reasoning_tokens": 350}}
+    ) == (150, 350)
+
+
+def test_a_reasoning_only_policy_still_has_to_stop(tmp_path):
+    """The allowance is bounded, not free. 2× the action budget, then 402."""
+    engine, seen = _engine(
+        [
+            (
+                200,
+                {
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 500,
+                        "reasoning_tokens": 500,
+                    }
+                },
+            )
+        ]
+    )
+    proxy, tokens = _proxy(tmp_path, f"http://127.0.0.1:{engine.server_address[1]}")
+    tok = tokens.issue("ep-think", ttl=60, budget=100)  # reasoning cap 200
+    assert _post(proxy.server_address[1], tok)[0] == 200  # first call records 500 reasoning
+    status, body = _post(proxy.server_address[1], tok)
+    assert status == 402 and "reasoning budget spent" in body["error"]["message"] and len(seen) == 1
+
+
 def test_a_spent_budget_is_an_ending_never_a_void(monkeypatch, tmp_path):
     import sh.validator.grade as g
 

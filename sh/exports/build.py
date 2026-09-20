@@ -3,11 +3,15 @@
 The competition exists to produce this. Every row is an episode that a **withheld** half verified, so the data
 says "this trajectory actually solved the task", not "this trajectory looked right".
 
-  * **SFT** — one row per verified, non-disqualified episode **of the crowned strategy**, in the converter's
-    `{from, value}` shape. The king's trajectories are the round's product; every other surface's are evidence.
-  * **DPO** — a chosen/rejected pair per instance: the king's best episode, doing at least 80 % of the withheld
-    checks, against another surface's episode (a rival, the baseline, the canon) doing at least 50 points fewer. The pair is only meaningful within one instance: across instances it would encode
-    difficulty. A round with no king exports nothing, and the manifest says so.
+  * **SFT** — one row per verified, non-disqualified, **non-truncated** episode of the crowned strategy, in the
+    converter's `{from, value}` shape. The king's trajectories are the round's product; every other surface's are
+    evidence. A trajectory the harness cut off (turn cap, token budget, or the host clock) is not a model to
+    imitate — its last step is the harness saying so.
+  * **DPO** — a chosen/rejected pair per instance. Prefer a correctness pair: the king's best untruncated episode,
+    doing at least 80 % of the withheld checks, against another surface doing at least 50 points fewer. When every
+    surface passes, fall back to an efficiency pair: the same king against a verified surface that cost at least
+    1.5× as many tokens. Across instances a pair would encode difficulty. A round with no king exports nothing,
+    and the manifest says so.
 
 Two rules from V4 govern the system turn, and they matter more than they look. The converter emits Hermes'
 *generic* function-calling prompt, which is not what the agent actually ran under — so the export replaces it
@@ -27,11 +31,17 @@ from pathlib import Path
 
 from sh.scoring.v2 import credit
 from sh.validator.grade import TEST_CHECKS
+from sh.validator.truncation import episode_truncated
 
 SCHEMA_SFT = "sh-sft-v2"
 SCHEMA_DPO = "sh-dpo-v2"
 DPO_CHOSEN_MIN = 0.8  # the preferred side must do most of the task
 DPO_MARGIN = 0.5  # and the other side at least this much less of it
+# Fallback when every surface on an instance passes: same task, same king, far fewer tokens. A round at a high
+# pass rate has no correctness loser, so the only preference left is the one the promotion discussion actually
+# scores — efficiency. Compared against the king's own cost, not a pooled median: we have one king episode per
+# instance, not a distribution of repeats.
+EFFICIENCY_MARGIN = 0.5
 
 
 def _leak_scan(text: str, secrets: set[str]) -> list[str]:
@@ -51,6 +61,16 @@ def _secrets(reveal: dict) -> set[str]:
                 continue
             secrets.update(str(a) for a in predicate[1:] if isinstance(a, str) and len(str(a)) >= 16)
     return secrets
+
+
+def _cost(episode: dict) -> int:
+    """Tokens billed to an episode: proxy prompt+completion, else 0. Unpriced episodes cannot rank by cost."""
+    tokens = episode.get("tokens")
+    if isinstance(tokens, dict):
+        return int(tokens.get("prompt_tokens") or 0) + int(tokens.get("completion_tokens") or 0)
+    if isinstance(tokens, (int, float)) and not isinstance(tokens, bool):
+        return int(tokens)
+    return 0
 
 
 def _rows_for(episode_dir: Path, episode: dict, task: dict, system_prompt: str) -> dict | None:
@@ -99,7 +119,15 @@ def build(
     secrets = _secrets(json.loads(reveal.read_text())) if reveal.exists() else set()
 
     sft, by_task = [], {}
-    gates = {"not_king": 0, "void": 0, "no_trajectory": 0, "not_verified": 0, "disqualified": 0, "leaked": 0}
+    gates = {
+        "not_king": 0,
+        "void": 0,
+        "no_trajectory": 0,
+        "not_verified": 0,
+        "disqualified": 0,
+        "leaked": 0,
+        "truncated": 0,
+    }
     for episode_json in sorted(episodes_dir.rglob("episode.json")):
         episode = json.loads(episode_json.read_text())
         task = tasks.get(str(episode.get("task_id")), {})
@@ -115,6 +143,11 @@ def build(
             continue
         if not episode.get("verified_success"):
             gates["not_verified"] += 1
+            continue
+        if episode_truncated(episode):
+            # SFT is imitation. A trajectory the harness cut off ends mid-work, and its last recorded step is
+            # the harness saying so. Training on it teaches stopping short.
+            gates["truncated"] += 1
             continue
         row = _rows_for(
             episode_json.parent,
@@ -142,13 +175,18 @@ def build(
         kings = [
             (credit(e), e, d)
             for e, d in entries
-            if e.get("surface") == king and not e.get("disqualified") and credit(e) >= DPO_CHOSEN_MIN
+            if e.get("surface") == king
+            and not e.get("disqualified")
+            and credit(e) >= DPO_CHOSEN_MIN
+            and not episode_truncated(e)  # a truncated pass is not the example: it stopped mid-work
         ]
-        chosen = rejected = None
+        chosen = rejected = chosen_ep = None
         c_credit = 0.0
         for c_credit, e, d in sorted(kings, key=lambda x: -x[0]):
             if (chosen := _rows_for(d, e, task, prompt)) is not None:
+                chosen_ep = e
                 break
+        kind = "correctness"
         if chosen is not None:
             losers = sorted(
                 (
@@ -159,6 +197,25 @@ def build(
                 key=lambda x: x[0],
             )
             rejected = next((row for _, e, d in losers if (row := _rows_for(d, e, task, prompt)) is not None), None)
+            if rejected is None and chosen_ep and _cost(chosen_ep) > 0:
+                # No correctness loser: every other surface also passed. Pair on cost instead, when the
+                # rejected side is clearly more expensive than the king — not on a 2% sampling wobble.
+                floor = _cost(chosen_ep) * (1 + EFFICIENCY_MARGIN)
+                expensive = sorted(
+                    (
+                        (_cost(e), e, d)
+                        for e, d in entries
+                        if e.get("surface") != king
+                        and not e.get("void")
+                        and e.get("verified_success")
+                        and _cost(e) >= floor
+                    ),
+                    key=lambda x: -x[0],
+                )
+                for _, e, d in expensive:
+                    if (rejected := _rows_for(d, e, task, prompt)) is not None:
+                        kind = "efficiency"
+                        break
         if chosen and rejected:
             # both sides carry the king's system turn and the same task, so the preference is over the trajectory
             # alone and not over which strategy prompt produced it
@@ -177,6 +234,7 @@ def build(
                     "rejected": rejected_turns,
                     "chosen_surface": chosen["surface"],
                     "rejected_surface": rejected["surface"],
+                    "kind": kind,
                 }
             )
 
